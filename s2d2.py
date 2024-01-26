@@ -143,6 +143,7 @@ class StableDiffusionImageGenerator:
             output_type="pil",
             clip_skip=1,
             decode_factor=0.18215,
+            num_images_per_prompt=1,
             seed=1234,
             save_path=None
             ):
@@ -165,13 +166,15 @@ class StableDiffusionImageGenerator:
                 negative_prompt_embeds=negative_embeds,
                 width=width,
                 height=height,
+                num_images_per_prompt=num_images_per_prompt,
                 output_type="latent"
             ).images # 1x4x(W/8)x(H/8)
 
             if save_path is not None:
-                pil_image = self.decode_latents_to_PIL_image(latents, decode_factor)
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                pil_image.save(save_path, quality=95)
+                i = 0
+                while i < num_images_per_prompt:
+                    latents[i].save(save_path[i])
+                    i += 1
 
             if output_type == "latent":
                 return latents
@@ -218,9 +221,7 @@ class StableDiffusionImageGenerator:
             ).images # 1x4x(W/8)x(H/8)
 
             if save_path is not None:
-                pil_image = self.decode_latents_to_PIL_image(latents, decode_factor)
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                pil_image.save(save_path, quality=95)
+                latents[0].save(save_path)
 
             if output_type == "latent":
                 return latents
@@ -242,6 +243,8 @@ class StableDiffusionImageGenerator:
             height=512,
             seed=1234,
             clip_skip=1,
+            save_nonhires=False,
+            num_images_per_prompt=1,
             hires_prompt=None,
             hires_negative_prompt=None,
             hires_seed=None,
@@ -280,12 +283,12 @@ class StableDiffusionImageGenerator:
                         width=w_final,
                         height=h_final,
                         clip_skip=clip_skip,
+                        num_images_per_prompt=num_images_per_prompt,
                         output_type=output_type,
                         decode_factor=decode_factor_final,
                         seed=seed,
-                        save_path=os.path.join(save_dir, f"{now_str}.jpg")
+                        save_path=[os.path.join(save_dir, f"{now_str}[{i}].png") i for i in list(range(num_images_per_prompt))]
                     )
-                return image
 
             
             for i, (w, h) in enumerate(resolution_pairs):
@@ -300,55 +303,58 @@ class StableDiffusionImageGenerator:
                         width=w,
                         height=h,
                         clip_skip=clip_skip,
+                        num_images_per_prompt=num_images_per_prompt,
                         output_type=upscale_target,
                         decode_factor=decode_factor,
                         seed=seed,
-                        save_path=os.path.join(save_dir, f"{now_str}_{i}.jpg")
+                        save_path=[os.path.join(save_dir, f"{now_str}_{i}[{j}].png") j for j in list(range(num_images_per_prompt))] if save_nonhires else None
                     )
                     continue
+                j = 0
+                while j < num_images_per_prompt:
+                    img = image[j]
+                    # Step 2: Interpolate latent or image -> PIL image
+                    if upscale_target == "latent":
+                        img = torch.nn.functional.interpolate(
+                                img,
+                                (h // 8, w // 8),
+                                mode=interpolate_mode,
+                                antialias=True if antialias and interpolate_mode != "nearest" else False,
+                            )
+                        img = self.decode_latents_to_PIL_image(img, decode_factor)
+                    else:
+                        img = img.resize((w, h), Image.Resampling.LANCZOS)
 
-                # Step 2: Interpolate latent or image -> PIL image
-                if upscale_target == "latent":
-                    image = torch.nn.functional.interpolate(
-                            image,
-                            (h // 8, w // 8),
-                            mode=interpolate_mode,
-                            antialias=True if antialias and interpolate_mode != "nearest" else False,
+                    # Step 3: Generate image (i2i) 
+                    if i < len(resolution_pairs) - 1:
+                        img = self.diffusion_from_image(
+                            hires_prompt,
+                            hires_negative_prompt,
+                            img,
+                            scheduler_name=hires_scheduler_name,
+                            steps=int(steps_enhance / denoising_strength) + 1,
+                            clip_skip=clip_skip,
+                            denoising_strength=denoising_strength,
+                            guidance_scale=guidance_scale,
+                            output_type=upscale_target,
+                            decode_factor=decode_factor,
+                            seed=hires_seed,
+                            save_path=os.path.join(save_dir, f"{now_str}_{i}.jpg") if save_nonhires else None
                         )
-                    image = self.decode_latents_to_PIL_image(image, decode_factor)
-                else:
-                    image = image.resize((w, h), Image.Resampling.LANCZOS)
 
-                # Step 3: Generate image (i2i) 
-                if i < len(resolution_pairs) - 1:
-                    image = self.diffusion_from_image(
-                        hires_prompt,
-                        hires_negative_prompt,
-                        image,
-                        scheduler_name=hires_scheduler_name,
-                        steps=int(steps_enhance / denoising_strength) + 1,
-                        clip_skip=clip_skip,
-                        denoising_strength=denoising_strength,
-                        guidance_scale=guidance_scale,
-                        output_type=upscale_target,
-                        decode_factor=decode_factor,
-                        seed=hires_seed,
-                        save_path=os.path.join(save_dir, f"{now_str}_{i}.jpg")
-                    )
-
-                else: # Final enhance
-                    image = self.diffusion_from_image(
-                        hires_prompt,
-                        hires_negative_prompt,
-                        image,
-                        scheduler_name=hires_scheduler_name,
-                        steps=int(steps_enhance / denoising_strength) + 1, 
-                        denoising_strength=denoising_strength,
-                        clip_skip=clip_skip,
-                        guidance_scale=guidance_scale,
-                        output_type=output_type,
-                        decode_factor=decode_factor_final,
-                        seed=hires_seed,
-                        save_path=os.path.join(save_dir, f"{now_str}_{i}.jpg")
-                    )
-                    return image
+                    else: # Final enhance
+                        img = self.diffusion_from_image(
+                            hires_prompt,
+                            hires_negative_prompt,
+                            img,
+                            scheduler_name=hires_scheduler_name,
+                            steps=int(steps_enhance / denoising_strength) + 1, 
+                            denoising_strength=denoising_strength,
+                            clip_skip=clip_skip,
+                            guidance_scale=guidance_scale,
+                            output_type=output_type,
+                            decode_factor=decode_factor_final,
+                            seed=hires_seed,
+                            save_path=os.path.join(save_dir, f"{now_str}_{i}.jpg")
+                        )
+                    j += 1
