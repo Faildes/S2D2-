@@ -15,8 +15,6 @@ import datetime
 from PIL import Image
 import numpy as np
 
-from lora import load_safetensors_lora
-
 SCHEDULERS = {
     "unipc": diffusers.schedulers.UniPCMultistepScheduler,
     "euler_a": diffusers.schedulers.EulerAncestralDiscreteScheduler,
@@ -25,7 +23,9 @@ SCHEDULERS = {
     "ddpm": diffusers.schedulers.DDPMScheduler,
     "deis": diffusers.schedulers.DEISMultistepScheduler,
     "dpm2": diffusers.schedulers.KDPM2DiscreteScheduler,
+    "dpm2_karras": diffusers.schedulers.KDPM2DiscreteScheduler,
     "dpm2-a": diffusers.schedulers.KDPM2AncestralDiscreteScheduler,
+    "dpm2-a_karras": diffusers.schedulers.KDPM2AncestralDiscreteScheduler,
     "dpm++_2s": diffusers.schedulers.DPMSolverSinglestepScheduler,
     "dpm++_2m": diffusers.schedulers.DPMSolverMultistepScheduler,
     "dpm++_2m_karras": diffusers.schedulers.DPMSolverMultistepScheduler,
@@ -42,6 +42,36 @@ def calc_pix_8(x):
     x = int(x)
     return x - x % 8
 
+def token_auto_concat_embeds(pipe, positive, negative):
+    max_length = pipe.tokenizer.model_max_length
+    positive_length = pipe.tokenizer(positive, return_tensors="pt").input_ids.shape[-1]
+    negative_length = pipe.tokenizer(negative, return_tensors="pt").input_ids.shape[-1]
+    
+    print(f'Token length is model maximum: {max_length}, positive length: {positive_length}, negative length: {negative_length}.')
+    if max_length < positive_length or max_length < negative_length:
+        print('Concatenated embedding.')
+        if positive_length > negative_length:
+            positive_ids = pipe.tokenizer(positive, return_tensors="pt").input_ids.to("cuda")
+            negative_ids = pipe.tokenizer(negative, truncation=False, padding="max_length", max_length=positive_ids.shape[-1], return_tensors="pt").input_ids.to("cuda")
+        else:
+            negative_ids = pipe.tokenizer(negative, return_tensors="pt").input_ids.to("cuda")  
+            positive_ids = pipe.tokenizer(positive, truncation=False, padding="max_length", max_length=negative_ids.shape[-1],  return_tensors="pt").input_ids.to("cuda")
+    else:
+        positive_ids = pipe.tokenizer(positive, truncation=False, padding="max_length", max_length=max_length,  return_tensors="pt").input_ids.to("cuda")
+        negative_ids = pipe.tokenizer(negative, truncation=False, padding="max_length", max_length=max_length, return_tensors="pt").input_ids.to("cuda")
+    
+    positive_concat_embeds = []
+    negative_concat_embeds = []
+    for i in range(0, positive_ids.shape[-1], max_length):
+        positive_concat_embeds.append(pipe.text_encoder(positive_ids[:, i: i + max_length])[0])
+        negative_concat_embeds.append(pipe.text_encoder(negative_ids[:, i: i + max_length])[0])
+    
+    positive_prompt_embeds = torch.cat(positive_concat_embeds, dim=1)
+    negative_prompt_embeds = torch.cat(negative_concat_embeds, dim=1)
+    return positive_prompt_embeds, negative_prompt_embeds
+
+def get_scheduler(p, name):
+    return SCHEDULERS[name].from_config(p.scheduler.config, use_karras_sigmas="karras" in name)
 
 class StableDiffusionImageGenerator:
     def __init__(
@@ -68,9 +98,18 @@ class StableDiffusionImageGenerator:
         return
     
     
-    def load_lora(self, safetensor_path, alpha=0.75):
-        self.pipe = load_safetensors_lora(self.pipe, safetensor_path, alpha=alpha, device=self.device)
-        self.pipe_i2i = load_safetensors_lora(self.pipe_i2i, safetensor_path, alpha=alpha, device=self.device)
+    def load_lora(self, safetensor_path:list, alphas:list=[0.75]):
+        adap_list=[]
+        for k in safetensor_path:
+            p = os.path.abspath(os.path.join(k, ".."))
+            safe = os.path.basename(k)
+            name = os.path.splitext(safe)[0].replace(".","_")
+            adap_list.append(name)
+            self.pipe.load_lora_weights(p, weight_name=safe, adapter_name=name)
+            self.pipe_i2i.load_lora_weights(p, weight_name=safe, adapter_name=name)
+        
+        self.pipe.set_adapters(adap_list, adapter_weights=alphas)
+        self.pipe_i2i.set_adapters(adap_list, adapter_weights=alphas)
 
 
     def decode_latents_to_PIL_image(self, latents, decode_factor=0.18215):
@@ -89,27 +128,33 @@ class StableDiffusionImageGenerator:
             prompt,
             negative_prompt,
             scheduler_name="dpm++_2m_karras",
-            num_inference_steps=20, 
+            steps=20, 
             guidance_scale=9.5,
             width=512,
             height=512,
             output_type="pil",
+            clip_skip=1,
             decode_factor=0.18215,
             seed=1234,
             save_path=None
             ):
 
-        self.pipe.scheduler = SCHEDULERS[scheduler_name].from_config(self.pipe.scheduler.config)
-        self.pipe.scheduler.set_timesteps(num_inference_steps, self.device)
+        self.pipe.scheduler = get_scheduler(self.pipe, scheduler_name)
+        self.pipe.scheduler.set_timesteps(steps, self.device)
+        clip_layers = pipe.text_encoder.text_model.encoder.layers
+        if clip_skip > 1:
+            sk = clip_skip-1
+            pipe.text_encoder.text_model.encoder.layers = clip_layers[:-sk]
         seed = random.randint(1, 1000000000) if seed == -1 else seed
+        embeds, negative_embeds = token_auto_concat_embeds(pipe, prompt, negative_prompt)
 
         with torch.no_grad():
             latents = self.pipe(
-                prompt=prompt, 
-                negative_prompt=negative_prompt,
-                num_inference_steps=num_inference_steps, 
+                prompt_embeds=embeds, 
+                num_inference_steps=steps, 
                 generator=torch.manual_seed(seed),
                 guidance_scale=guidance_scale,
+                negative_prompt_embeds=negative_embeds,
                 width=width,
                 height=height,
                 output_type="latent"
@@ -133,28 +178,34 @@ class StableDiffusionImageGenerator:
             negative_prompt,
             image,
             scheduler_name="dpm++_2m_karras",
-            num_inference_steps=20,
+            steps=20,
             denoising_strength=0.58,
             guidance_scale=10,
+            clip_skip=1,
             output_type="pil",
             decode_factor=0.18215,
             seed=1234,
             save_path=None
             ):
 
-        self.pipe_i2i.scheduler = SCHEDULERS[scheduler_name].from_config(self.pipe_i2i.scheduler.config)
-        self.pipe_i2i.scheduler.set_timesteps(num_inference_steps, self.device)
+        self.pipe_i2i.scheduler = get_scheduler(self.pipe_i2i, scheduler_name)
+        self.pipe_i2i.scheduler.set_timesteps(steps, self.device)
         seed = random.randint(1, 1000000000) if seed == -1 else seed
+        clip_layers = pipe.text_encoder.text_model.encoder.layers
+        if clip_skip > 1:
+            sk = clip_skip-1
+            pipe_i2i.text_encoder.text_model.encoder.layers = clip_layers[:-sk]
+        embeds, negative_embeds = token_auto_concat_embeds(pipe, prompt, negative_prompt)
 
         with torch.no_grad():
             latents = self.pipe_i2i(
-                prompt=prompt, 
-                negative_prompt=negative_prompt,
+                prompt_embeds=embeds, 
                 image=image,
-                num_inference_steps=num_inference_steps, 
+                num_inference_steps=steps, 
                 strength=denoising_strength,
                 generator=torch.manual_seed(seed),
                 guidance_scale=guidance_scale,
+                negative_prompt_embeds=negative_embeds,
                 output_type="latent"
             ).images # 1x4x(W/8)x(H/8)
 
@@ -176,12 +227,17 @@ class StableDiffusionImageGenerator:
             prompt,
             negative_prompt,
             scheduler_name="dpm++_2m_karras",
-            num_inference_steps=20,
-            num_inference_steps_enhance=20,
+            steps=20,
+            steps_enhance=20,
             guidance_scale=10,
             width=512,
             height=512,
             seed=1234,
+            clip_skip=1,
+            hires_prompt=None,
+            hires_negative_prompt=None,
+            hires_seed=None,
+            hires_scheduler_name=None,
             upscale_target="latent", # "latent" or "pil"
             interpolate_mode="nearest",
             antialias = True,
@@ -211,10 +267,11 @@ class StableDiffusionImageGenerator:
                         prompt,
                         negative_prompt,
                         scheduler_name=scheduler_name,
-                        num_inference_steps=num_inference_steps, 
+                        steps=steps, 
                         guidance_scale=guidance_scale,
                         width=w_final,
                         height=h_final,
+                        clip_skip=clip_skip,
                         output_type=output_type,
                         decode_factor=decode_factor_final,
                         seed=seed,
@@ -230,10 +287,11 @@ class StableDiffusionImageGenerator:
                         prompt,
                         negative_prompt,
                         scheduler_name=scheduler_name,
-                        num_inference_steps=num_inference_steps, 
+                        steps=steps, 
                         guidance_scale=guidance_scale,
                         width=w,
                         height=h,
+                        clip_skip=clip_skip,
                         output_type=upscale_target,
                         decode_factor=decode_factor,
                         seed=seed,
@@ -256,32 +314,33 @@ class StableDiffusionImageGenerator:
                 # Step 3: Generate image (i2i) 
                 if i < len(resolution_pairs) - 1:
                     image = self.diffusion_from_image(
-                        prompt,
-                        negative_prompt,
+                        hires_prompt,
+                        hires_negative_prompt,
                         image,
-                        scheduler_name=scheduler_name,
-                        num_inference_steps=int(num_inference_steps_enhance / denoising_strength) + 1, 
+                        scheduler_name=hires_scheduler_name,
+                        steps=int(steps_enhance / denoising_strength) + 1,
+                        clip_skip=clip_skip,
                         denoising_strength=denoising_strength,
                         guidance_scale=guidance_scale,
                         output_type=upscale_target,
                         decode_factor=decode_factor,
-                        seed=seed,
+                        seed=hires_seed,
                         save_path=os.path.join(save_dir, f"{now_str}_{i}.jpg")
                     )
 
                 else: # Final enhance
                     image = self.diffusion_from_image(
-                        prompt,
-                        negative_prompt,
+                        hires_prompt,
+                        hires_negative_prompt,
                         image,
-                        scheduler_name=scheduler_name,
-                        num_inference_steps=int(num_inference_steps_enhance / denoising_strength) + 1, 
+                        scheduler_name=hires_scheduler_name,
+                        steps=int(steps_enhance / denoising_strength) + 1, 
                         denoising_strength=denoising_strength,
+                        clip_skip=clip_skip,
                         guidance_scale=guidance_scale,
                         output_type=output_type,
                         decode_factor=decode_factor_final,
-                        seed=seed,
+                        seed=hires_seed,
                         save_path=os.path.join(save_dir, f"{now_str}_{i}.jpg")
                     )
                     return image
-    
