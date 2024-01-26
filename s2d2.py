@@ -168,7 +168,9 @@ class StableDiffusionImageGenerator:
             if save_path is not None:
                 i = 0
                 while i < num_images_per_prompt:
-                    latents[i].save(save_path[i])
+                    pil_image = self.decode_latents_to_PIL_image(latents[i], decode_factor)
+                    os.makedirs(os.path.dirname(save_path[i]), exist_ok=True)
+                    pil_image.save(save_path[i])
                     i += 1
 
             if output_type == "latent":
@@ -216,7 +218,9 @@ class StableDiffusionImageGenerator:
             ).images # 1x4x(W/8)x(H/8)
 
             if save_path is not None:
-                latents[0].save(save_path)
+                pil_image = self.decode_latents_to_PIL_image(latents, decode_factor)
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                pil_image.save(save_path)
 
             if output_type == "latent":
                 return latents
