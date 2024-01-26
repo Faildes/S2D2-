@@ -83,14 +83,8 @@ class StableDiffusionImageGenerator:
             dtype: torch.dtype=torch.float16,
             ):
         self.device = torch.device(device)
-        self.pipe = StableDiffusionPipeline.from_ckpt(
-            sd_safetensor_path,
-            torch_dtype=dtype,
-        ).to(device)
-        self.pipe_i2i = StableDiffusionImg2ImgPipeline.from_ckpt(
-            sd_safetensor_path,
-            torch_dtype=dtype,
-        ).to(device)
+        self.pipe = StableDiffusionPipeline.from_single_file(sd_safetensor_path,torch_dtype=dtype,).to(device)
+        self.pipe_i2i = StableDiffusionImg2ImgPipeline.from_single_file(sd_safetensor_path,torch_dtype=dtype,).to(device)
         self.pipe.enable_xformers_memory_efficient_attention()
         self.pipe.enable_attention_slicing()
         self.pipe_i2i.enable_xformers_memory_efficient_attention()
@@ -102,6 +96,7 @@ class StableDiffusionImageGenerator:
     
     def load_loras(self, safetensor_path:list[list[str,float]]):
         adap_list=[]
+        alphas=[]
         for k in safetensor_path:
             p = os.path.abspath(os.path.join(k[0], ".."))
             safe = os.path.basename(k[0])
@@ -150,12 +145,12 @@ class StableDiffusionImageGenerator:
 
         self.pipe.scheduler = get_scheduler(self.pipe, scheduler_name)
         self.pipe.scheduler.set_timesteps(steps, self.device)
-        clip_layers = pipe.text_encoder.text_model.encoder.layers
+        clip_layers = self.pipe.text_encoder.text_model.encoder.layers
         if clip_skip > 1:
             sk = clip_skip-1
-            pipe.text_encoder.text_model.encoder.layers = clip_layers[:-sk]
+            self.pipe.text_encoder.text_model.encoder.layers = clip_layers[:-sk]
         seed = random.randint(1, 1000000000) if seed == -1 else seed
-        embeds, negative_embeds = token_auto_concat_embeds(pipe, prompt, negative_prompt)
+        embeds, negative_embeds = token_auto_concat_embeds(self.pipe, prompt, negative_prompt)
 
         with torch.no_grad():
             latents = self.pipe(
@@ -202,11 +197,11 @@ class StableDiffusionImageGenerator:
         self.pipe_i2i.scheduler = get_scheduler(self.pipe_i2i, scheduler_name)
         self.pipe_i2i.scheduler.set_timesteps(steps, self.device)
         seed = random.randint(1, 1000000000) if seed == -1 else seed
-        clip_layers = pipe.text_encoder.text_model.encoder.layers
+        clip_layers = self.pipe_i2i.text_encoder.text_model.encoder.layers
         if clip_skip > 1:
             sk = clip_skip-1
-            pipe_i2i.text_encoder.text_model.encoder.layers = clip_layers[:-sk]
-        embeds, negative_embeds = token_auto_concat_embeds(pipe, prompt, negative_prompt)
+            self.pipe_i2i.text_encoder.text_model.encoder.layers = clip_layers[:-sk]
+        embeds, negative_embeds = token_auto_concat_embeds(self.pipe_i2i, prompt, negative_prompt)
 
         with torch.no_grad():
             latents = self.pipe_i2i(
@@ -287,7 +282,7 @@ class StableDiffusionImageGenerator:
                         output_type=output_type,
                         decode_factor=decode_factor_final,
                         seed=seed,
-                        save_path=[os.path.join(save_dir, f"{now_str}[{i}].png") i for i in list(range(num_images_per_prompt))]
+                        save_path=[os.path.join(save_dir, f"{now_str}[{i}].png") for i in list(range(num_images_per_prompt))]
                     )
 
             
@@ -307,7 +302,7 @@ class StableDiffusionImageGenerator:
                         output_type=upscale_target,
                         decode_factor=decode_factor,
                         seed=seed,
-                        save_path=[os.path.join(save_dir, f"{now_str}_{i}[{j}].png") j for j in list(range(num_images_per_prompt))] if save_nonhires else None
+                        save_path=[os.path.join(save_dir, f"{now_str}_{i}[{j}].png") for j in list(range(num_images_per_prompt))] if save_nonhires else None
                     )
                     continue
                 j = 0
