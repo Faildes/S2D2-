@@ -100,12 +100,13 @@ class StableDiffusionImageGenerator:
         return
     
     
-    def load_loras(self, safetensor_path:list, alphas:list=[0.75]):
+    def load_loras(self, safetensor_path:list[list[str,float]]):
         adap_list=[]
         for k in safetensor_path:
-            p = os.path.abspath(os.path.join(k, ".."))
-            safe = os.path.basename(k)
+            p = os.path.abspath(os.path.join(k[0], ".."))
+            safe = os.path.basename(k[0])
             name = os.path.splitext(safe)[0].replace(".","_")
+            alphas.append(k[1])
             adap_list.append(name)
             self.pipe.load_lora_weights(p, weight_name=safe, adapter_name=name)
             self.pipe_i2i.load_lora_weights(p, weight_name=safe, adapter_name=name)
