@@ -4,3 +4,4 @@ diffusers
 xformers
 accelerate
 peft
+omegaconf
