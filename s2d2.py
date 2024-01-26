@@ -15,6 +15,8 @@ import datetime
 from PIL import Image
 import numpy as np
 
+import re
+
 SCHEDULERS = {
     "unipc": diffusers.schedulers.UniPCMultistepScheduler,
     "euler_a": diffusers.schedulers.EulerAncestralDiscreteScheduler,
@@ -98,7 +100,7 @@ class StableDiffusionImageGenerator:
         return
     
     
-    def load_lora(self, safetensor_path:list, alphas:list=[0.75]):
+    def load_loras(self, safetensor_path:list, alphas:list=[0.75]):
         adap_list=[]
         for k in safetensor_path:
             p = os.path.abspath(os.path.join(k, ".."))
@@ -110,6 +112,11 @@ class StableDiffusionImageGenerator:
         
         self.pipe.set_adapters(adap_list, adapter_weights=alphas)
         self.pipe_i2i.set_adapters(adap_list, adapter_weights=alphas)
+
+    def load_embeddings(self, embeddings:list[list[str,str]]):
+        for k in embeddings:
+            self.pipe.load_textual_inversion(pretrained_model_name_or_path=k[0], token=k[1], local_files_only=True)
+            self.pipe_i2i.load_textual_inversion(pretrained_model_name_or_path=k[0], token=k[1], local_files_only=True)
 
 
     def decode_latents_to_PIL_image(self, latents, decode_factor=0.18215):
